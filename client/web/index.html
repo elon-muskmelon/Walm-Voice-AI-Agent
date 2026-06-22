@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Low-latency real-time voice pipeline: streaming microphone input, multilingual speech-to-text, Gemini LLM, and custom Indic TTS output." />
+  <title>Voice Pipeline — STT · LLM · TTS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Low-Latency Voice Pipeline</p>
+        <h1>Talk to the system. Hear it back fast.</h1>
+        <p class="sub">Streaming microphone input, multilingual STT, Gemini reasoning, and custom Indic TTS voice output.</p>
+      </div>
+      <div class="status">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-text">Disconnected</span>
+      </div>
+    </header>
+
+    <section class="controls">
+      <button id="mic-btn" class="primary" type="button">🎙 Mic Off</button>
+      <button id="stop-btn" class="secondary" type="button" disabled>Stop</button>
+      <div class="pill">Target: <strong>16 kHz PCM</strong></div>
+    </section>
+
+    <section class="panels">
+      <div class="panel">
+        <h2>Live Transcript</h2>
+        <pre id="transcript" class="mono"></pre>
+      </div>
+      <div class="panel">
+        <h2>Assistant Reply</h2>
+        <pre id="reply" class="mono"></pre>
+      </div>
+    </section>
+
+    <section class="audio">
+      <h2>Streaming Output</h2>
+      <audio id="audio" controls></audio>
+    </section>
+  </main>
+
+  <script src="/static/pcm-player.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
