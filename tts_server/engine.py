@@ -4,7 +4,9 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -20,6 +22,30 @@ from tts_server.prompt import (
 from tts_server.streaming import float32_to_pcm16_bytes
 
 logger = logging.getLogger("tts_engine")
+
+_DEBUG_LOG = Path(__file__).resolve().parents[1] / "debug-a644a1.log"
+
+
+def probe(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    import json
+
+    payload = {
+        "sessionId": "a644a1",
+        "runId": "choppy-verify",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with _DEBUG_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # endregion
+
 
 _model = None
 _tokenizer = None
@@ -111,36 +137,6 @@ def is_loaded() -> bool:
     return _model is not None
 
 
-def _audio_ids_to_codes(audio_ids: list[int]) -> list[list[int]] | None:
-    """Convert raw audio token ids to SNAC codebooks (full frames only)."""
-    if not audio_ids:
-        return None
-
-    clean: list[int] = []
-    frame_count = (len(audio_ids) + 6) // 7
-    for i in range(frame_count):
-        for j in range(7):
-            idx = 7 * i + j
-            if idx < len(audio_ids):
-                clean.append(audio_ids[idx] - AUDIO_START_ID)
-
-    codes: list[list[int]] = [[], [], []]
-    code_frames = len(clean) // 7
-    for i in range(code_frames):
-        base = 7 * i
-        if base + 6 >= len(clean):
-            break
-        codes[0].append(clean[base])
-        codes[1].append(clean[base + 1] - 4096)
-        codes[2].append(clean[base + 2] - (2 * 4096))
-        codes[2].append(clean[base + 3] - (3 * 4096))
-        codes[1].append(clean[base + 4] - (4 * 4096))
-        codes[2].append(clean[base + 5] - (5 * 4096))
-        codes[2].append(clean[base + 6] - (6 * 4096))
-
-    return codes if codes[0] else None
-
-
 def _decode_codes(codes: list[list[int]]) -> np.ndarray | None:
     """Decode SNAC codebooks to float32 mono waveform."""
     if _snac_model is None or not codes or not codes[0]:
@@ -162,6 +158,15 @@ def _decode_codes(codes: list[list[int]]) -> np.ndarray | None:
     except Exception:
         logger.exception("SNAC decode failed")
         return None
+
+
+def _audio_token_budget(text: str) -> int:
+    """Cap generation length from input size (runtime: ~14 audio tokens/char)."""
+    chars = max(1, len(text.strip()))
+    return min(
+        config.MAX_NEW_TOKENS,
+        max(config.AUDIO_TOKENS_MIN, chars * config.AUDIO_TOKENS_PER_CHAR),
+    )
 
 
 def _apply_speed(waveform: np.ndarray, speed: float) -> np.ndarray:
@@ -194,10 +199,13 @@ def _prepare_generation(text: str, language: str, speaker_id: str) -> tuple | No
         speaker_id=speaker_id,
     )
     inputs = _tokenizer(prompt, add_special_tokens=False, return_tensors="pt")
-    max_tokens = config.MAX_SEQ_LENGTH - inputs.input_ids.shape[1]
+    prompt_len = int(inputs.input_ids.shape[1])
+    max_tokens = config.MAX_SEQ_LENGTH - prompt_len
     if max_tokens <= 0:
         logger.error("Prompt too long for max_seq_length=%d", config.MAX_SEQ_LENGTH)
         return None
+    audio_budget = _audio_token_budget(text)
+    max_tokens = min(max_tokens, audio_budget + config.AUDIO_TOKEN_PREAMBLE)
 
     gen_kwargs = {
         "input_ids": inputs.input_ids.to(model_device),
@@ -209,23 +217,46 @@ def _prepare_generation(text: str, language: str, speaker_id: str) -> tuple | No
         "repetition_penalty": config.REPETITION_PENALTY,
         "eos_token_id": END_OF_SPEECH_ID,
     }
-    return gen_kwargs, model_device
+    return gen_kwargs, model_device, audio_budget
 
 
 class _SnacFrameStreamer(BaseStreamer):
-    """Decode SNAC frames incrementally as audio tokens arrive from generate()."""
+    """Decode SNAC frames; cumulative mode keeps all codes for gapless audio."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._audio_ids: list[int] = []
+        self._frame_tokens: list[int] = []
+        self._all_codes: list[list[int]] = [[], [], []]
+        self._frames_since_emit = 0
         self._decoded_samples = 0
         self._chunk_queue: queue.Queue[np.ndarray | None] = queue.Queue()
+        self.total_tokens = 0
+        self.audio_tokens = 0
+        self.emit_count = 0
+        self._buffered = config.DECODE_MODE == "buffered"
+        self._stream_start = time.monotonic()
+        self._last_emit_at: float | None = None
 
     def _process_token(self, tid: int) -> None:
+        self.total_tokens += 1
         if tid >= AUDIO_START_ID and tid != END_OF_SPEECH_ID:
-            self._audio_ids.append(tid)
-            if len(self._audio_ids) % 7 == 0:
-                self._emit_delta()
+            self.audio_tokens += 1
+            self._frame_tokens.append(tid - AUDIO_START_ID)
+            if len(self._frame_tokens) == 7:
+                self._append_frame(self._frame_tokens)
+                self._frame_tokens = []
+                self._frames_since_emit += 1
+                if not self._buffered and self._frames_since_emit >= config.STREAM_DECODE_FRAMES:
+                    self._emit_delta()
+
+    def _append_frame(self, frame: list[int]) -> None:
+        self._all_codes[0].append(frame[0])
+        self._all_codes[1].append(frame[1] - 4096)
+        self._all_codes[2].append(frame[2] - (2 * 4096))
+        self._all_codes[2].append(frame[3] - (3 * 4096))
+        self._all_codes[1].append(frame[4] - (4 * 4096))
+        self._all_codes[2].append(frame[5] - (5 * 4096))
+        self._all_codes[2].append(frame[6] - (6 * 4096))
 
     def put(self, value: torch.Tensor) -> None:
         if value.ndim == 2:
@@ -237,6 +268,7 @@ class _SnacFrameStreamer(BaseStreamer):
                 self._process_token(int(tid))
 
     def end(self) -> None:
+        self._emit_delta()
         self._chunk_queue.put(None)
 
     def iter_chunks(self) -> Iterator[np.ndarray]:
@@ -247,15 +279,40 @@ class _SnacFrameStreamer(BaseStreamer):
             yield chunk
 
     def _emit_delta(self) -> None:
-        codes = _audio_ids_to_codes(self._audio_ids)
-        if not codes:
+        if not self._all_codes[0]:
             return
-        waveform = _decode_codes(codes)
+        t0 = time.monotonic()
+        waveform = _decode_codes(self._all_codes)
+        decode_ms = (time.monotonic() - t0) * 1000.0
         if waveform is None or len(waveform) <= self._decoded_samples:
+            self._frames_since_emit = 0
             return
         delta = waveform[self._decoded_samples :]
         self._decoded_samples = len(waveform)
+        self._frames_since_emit = 0
         if len(delta) > 0:
+            self.emit_count += 1
+            now = time.monotonic()
+            gap_ms = (
+                (now - self._last_emit_at) * 1000.0 if self._last_emit_at else 0.0
+            )
+            self._last_emit_at = now
+            # region agent log
+            probe(
+                "A",
+                "tts_server/engine.py:emit_delta",
+                "SNAC delta emitted",
+                {
+                    "emit_count": self.emit_count,
+                    "delta_samples": len(delta),
+                    "delta_ms": round(len(delta) / config.SAMPLE_RATE * 1000, 1),
+                    "frames_total": len(self._all_codes[0]),
+                    "decode_ms": round(decode_ms, 1),
+                    "gap_since_last_emit_ms": round(gap_ms, 1),
+                    "mode": config.DECODE_MODE,
+                },
+            )
+            # endregion
             self._chunk_queue.put(delta)
 
 
@@ -269,7 +326,7 @@ def generate_audio_stream(
     prepared = _prepare_generation(text, language, speaker_id)
     if prepared is None:
         return
-    gen_kwargs, _model_device = prepared
+    gen_kwargs, _model_device, audio_budget = prepared
 
     streamer = _SnacFrameStreamer()
     gen_kwargs["streamer"] = streamer
@@ -293,6 +350,13 @@ def generate_audio_stream(
     thread.join()
     if error_box:
         raise error_box[0]
+    logger.info(
+        "generate_done audio_tokens=%d total_tokens=%d budget=%d mode=%s",
+        streamer.audio_tokens,
+        streamer.total_tokens,
+        audio_budget,
+        config.DECODE_MODE,
+    )
 
 
 def generate_audio(

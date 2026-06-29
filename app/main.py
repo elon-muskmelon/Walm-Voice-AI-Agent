@@ -306,6 +306,9 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 utterance = await state.utterance_queue.get()
                 if utterance is None:
                     break
+                if state.voice_task and not state.voice_task.done():
+                    logger.info("utterance_dropped voice_pipeline_busy")
+                    continue
                 await _process_utterance(utterance)
         except Exception as exc:
             await state.send_json({"type": "error", "message": f"STT error: {exc}"})
@@ -343,8 +346,15 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                             except Exception as exc:
                                 logger.warning("stt pre-buffer send failed: %s", exc)
 
-                    # Forward live speech frames to STT
-                    if segmenter.state == "SPEECH" and stt_session.is_connected:
+                    # Forward live speech frames to STT (skip while assistant pipeline runs)
+                    pipeline_busy = (
+                        state.voice_task is not None and not state.voice_task.done()
+                    )
+                    if (
+                        segmenter.state == "SPEECH"
+                        and stt_session.is_connected
+                        and not pipeline_busy
+                    ):
                         try:
                             await stt_session.send_pcm(frame)
                         except Exception as exc:

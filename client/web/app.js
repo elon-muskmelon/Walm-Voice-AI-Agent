@@ -39,6 +39,7 @@ let llmStreaming  = false;
 let wsOpening     = null;
 let audioFormat   = "audio/mpeg";
 let pcmPlayer     = null;
+let pcmBufferUntilEnd = true;
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
 function setStatus(active, text) {
@@ -84,7 +85,7 @@ function setupMediaSource() {
   });
 }
 
-function resetPlayback(format) {
+function resetPlayback(format, options = {}) {
   audioFormat = format || audioFormat;
   appendQueue     = [];
   sourceOpen      = false;
@@ -97,7 +98,10 @@ function resetPlayback(format) {
 
   if (isPcmFormat(audioFormat)) {
     audioEl.classList.add("hidden");
-    pcmPlayer = new PCMPlayer(pcmSampleRate(audioFormat));
+    pcmBufferUntilEnd = options.bufferUntilEnd !== false;
+    pcmPlayer = new PCMPlayer(pcmSampleRate(audioFormat), {
+      bufferUntilEnd: pcmBufferUntilEnd,
+    });
     return;
   }
 
@@ -239,7 +243,7 @@ function connect() {
   ws.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
       enqueueChunk(new Uint8Array(event.data));
-      if (!playbackStarted) {
+      if (!pcmBufferUntilEnd && !playbackStarted) {
         playbackStarted = true;
         ensurePlayback();
       }
@@ -273,12 +277,25 @@ function connect() {
 
     if (msg.type === "audio") {
       if (msg.event === "start") {
-        resetPlayback(msg.format || "audio/mpeg");
-        ensurePlayback();
-        setUIState("speaking");
+        resetPlayback(msg.format || "audio/mpeg", {
+          bufferUntilEnd: msg.buffer_until_end !== false,
+        });
+        if (msg.buffer_until_end) {
+          setUIState("processing");
+          statusText.textContent = "Generating speech…";
+        } else {
+          ensurePlayback();
+          setUIState("speaking");
+        }
       }
       if (msg.event === "end") {
-        if (!isPcmFormat(audioFormat) && mediaSource?.readyState === "open") {
+        if (isPcmFormat(audioFormat)) {
+          pcmPlayer?.flush().then(() => {
+            playbackStarted = true;
+            ensurePlayback();
+            setUIState("speaking");
+          });
+        } else if (mediaSource?.readyState === "open") {
           try { mediaSource.endOfStream(); } catch (_) {}
         }
       }

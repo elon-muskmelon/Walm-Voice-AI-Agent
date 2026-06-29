@@ -1,11 +1,17 @@
 /**
- * Streaming PCM playback via Web Audio API (24 kHz Int16 mono).
+ * PCM playback via Web Audio API (24 kHz Int16 mono).
+ * bufferUntilEnd=true: play full utterance on flush (slow_gpu).
+ * bufferUntilEnd=false: gapless streaming with small prebuffer (balanced/fast_gpu).
  */
 class PCMPlayer {
-  constructor(sampleRate = 24000) {
+  constructor(sampleRate = 24000, { bufferUntilEnd = true } = {}) {
     this.sampleRate = sampleRate;
+    this.bufferUntilEnd = bufferUntilEnd;
     this.audioContext = null;
+    this.pending = new Int16Array(0);
     this.nextTime = 0;
+    this.started = false;
+    this.prebufferSamples = Math.floor(sampleRate * 0.25);
   }
 
   async ensureContext() {
@@ -18,16 +24,25 @@ class PCMPlayer {
   }
 
   reset() {
+    this.pending = new Int16Array(0);
     this.nextTime = 0;
+    this.started = false;
     if (this.audioContext) {
       this.audioContext.close().catch(() => {});
       this.audioContext = null;
     }
   }
 
-  async enqueue(arrayBuffer) {
-    await this.ensureContext();
-    const int16 = new Int16Array(arrayBuffer);
+  _appendPending(arrayBuffer) {
+    const incoming = new Int16Array(arrayBuffer);
+    if (!incoming.length) return;
+    const merged = new Int16Array(this.pending.length + incoming.length);
+    merged.set(this.pending);
+    merged.set(incoming, this.pending.length);
+    this.pending = merged;
+  }
+
+  _scheduleBuffer(int16) {
     if (!int16.length) return;
 
     const float32 = new Float32Array(int16.length);
@@ -43,11 +58,38 @@ class PCMPlayer {
     source.connect(this.audioContext.destination);
 
     const now = this.audioContext.currentTime;
-    if (this.nextTime < now) {
-      this.nextTime = now + 0.02;
+    if (!this.started) {
+      this.nextTime = now + 0.05;
+      this.started = true;
     }
-    source.start(this.nextTime);
-    this.nextTime += buffer.duration;
+    const startAt = Math.max(this.nextTime, now);
+    source.start(startAt);
+    this.nextTime = startAt + buffer.duration;
+  }
+
+  async enqueue(arrayBuffer) {
+    await this.ensureContext();
+    this._appendPending(arrayBuffer);
+
+    if (this.bufferUntilEnd) {
+      return;
+    }
+
+    if (!this.started && this.pending.length < this.prebufferSamples) {
+      return;
+    }
+
+    const block = this.pending;
+    this.pending = new Int16Array(0);
+    this._scheduleBuffer(block);
+  }
+
+  async flush() {
+    if (!this.pending.length) return;
+    await this.ensureContext();
+    const block = this.pending;
+    this.pending = new Int16Array(0);
+    this._scheduleBuffer(block);
   }
 }
 

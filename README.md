@@ -28,6 +28,8 @@ Copy `.env.example` to `.env` and set:
 | `ELEVENLABS_API_KEY` | STT only |
 | `TTS_BACKEND=custom` | Use GPU sidecar for speech |
 | `TTS_SERVICE_URL=http://localhost:8100` | Sidecar URL |
+| `TTS_MODE=single` | **One TTS call per full LLM reply** (recommended) |
+| `TTS_LATENCY_PROFILE=slow_gpu` | Local 4050: buffer then play. Use `fast_gpu` on RunPod |
 | `TTS_MODEL_ID=C:\Model` | Local model path (sidecar reads this) |
 | `TTS_LOAD_IN_4BIT=true` | Required for 6 GB VRAM |
 
@@ -68,42 +70,43 @@ flowchart LR
   VAD --> STT["ElevenLabs STT"]
   STT --> Pipeline["VoicePipeline"]
   Pipeline --> Gemini["Gemini LLM"]
-  Pipeline --> TTSClient["CustomTTSStreamer"]
+  Gemini --> Collect["Full LLM reply"]
+  Collect --> TTSClient["One TTS HTTP call"]
   TTSClient --> Sidecar["tts_server :8100"]
   Sidecar --> SNAC["SNAC decode"]
-  SNAC --> PCM["24 kHz PCM"]
+  SNAC --> PCM["24 kHz PCM stream"]
   PCM --> Browser
 ```
 
 - **VAD:** Silero ONNX (`models/silero_vad.onnx`) or WebRTC fallback
 - **STT:** ElevenLabs Realtime WebSocket, manual commit on local endpoint
-- **LLM:** Gemini streaming per WebSocket session; replies in the user's detected language
-- **TTS:** Transformers + BitsAndBytes 4-bit loader with incremental SNAC streaming
+- **LLM:** Gemini streaming to UI; full reply sent to TTS once (`TTS_MODE=single`)
+- **TTS:** Transformers + SNAC; one `/v1/tts/stream` POST per assistant turn
 
-Language is auto-detected from the STT transcript and mapped to a default speaker (e.g. Hindi → speaker `159`, English → speaker `159`).
+## Latency profiles
 
-## Windows notes
+| Profile | Main app | Sidecar | Playback |
+|---------|----------|---------|----------|
+| `balanced` (default) | `TTS_LATENCY_PROFILE=balanced` | `TTS_DECODE_MODE=buffered` | Stream PCM to browser during generation; client plays on end (fluent on RTX 4050) |
+| `slow_gpu` | `TTS_LATENCY_PROFILE=slow_gpu` | `TTS_DECODE_MODE=buffered` | Server buffers all PCM before send — same fluency, higher server memory |
+| `fast_gpu` | `TTS_LATENCY_PROFILE=fast_gpu` | `TTS_DECODE_MODE=cumulative` | End-to-end streaming when GPU beats realtime (RunPod 4090+) |
 
-- Pin **`transformers==4.53.1`** in `tts_server/requirements.txt` — version 5.x can crash during model load on Windows
-- Close memory-heavy apps before starting the sidecar (model load needs RAM headroom)
-- Never commit `.env` — use `.env.example` only
-
-## Tuning latency
-
-Lower values = faster first response, more cut-offs / choppier speech.
+Other tuning:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
+| `TTS_MODE` | `single` | `single` = one TTS per reply; `segment` = early multi-call (legacy) |
 | `VAD_END_SILENCE_MS` | 400 | Silence before STT commit |
-| `TTS_MIN_CHARS` | 6 | Min LLM chars before first TTS call |
-| `TTS_SEGMENT_TIMEOUT_MS` | 100 | Max wait for phrase boundary |
+| `GEMINI_MODEL` | `gemini-2.0-flash-lite` | LLM speed |
 
-The sidecar streams PCM incrementally as SNAC frames decode (every 7 audio tokens).
+Check pipeline logs for `tts_request_count=1` and `time_to_first_audio`.
 
 ## Tests
 
 ```powershell
 pytest tests/ -q
+python scripts/verify_e2e.py
+python scripts/verify_e2e.py --benchmark
 ```
 
 ## Troubleshooting
@@ -113,31 +116,39 @@ pytest tests/ -q
 | Access violation on model load | `pip install "transformers==4.53.1"` |
 | Paging file too small | Increase Windows virtual memory; close other apps |
 | `STT connect failed` | Check `ELEVENLABS_API_KEY` |
+| `stt_error quota` | Refresh ElevenLabs quota; STT is muted during TTS playback |
 | `TTS sidecar error 503` | Sidecar still loading — wait for `TTS server ready` |
-| Text works, no audio | Sidecar not running or wrong `TTS_SERVICE_URL` |
-| English speech → Hindi reply | Check main app logs for `voice_route language=...` |
+| `tts_request_count` > 1 | Set `TTS_MODE=single` |
+| Choppy speech on 4050 | Use `TTS_LATENCY_PROFILE=slow_gpu` |
+| High latency on 4050 | Expected; move sidecar to RunPod 4090+ |
 
-## Remote GPU sidecar (cloud deploy)
+## Remote GPU sidecar (RunPod)
 
-Only the TTS sidecar moves to a GPU server; the main app can stay on your laptop.
+Only the TTS sidecar runs on the GPU pod; main app + browser stay on your laptop.
 
-### On the GPU server
+### On the RunPod GPU (4090 24GB+ recommended)
 
-1. Clone the repo and install `tts_server/requirements.txt`
-2. Set in `.env`:
+1. Clone repo, install `tts_server/requirements.txt`
+2. Set in pod `.env`:
    ```
-   TTS_MODEL_ID=/path/to/model
-   TTS_LOAD_IN_4BIT=true
+   TTS_MODEL_ID=/workspace/model
+   TTS_LOAD_IN_4BIT=false
+   TTS_DECODE_MODE=cumulative
+   TTS_STREAM_DECODE_FRAMES=2
+   TTS_PCM_CHUNK_MS=200
    ```
-3. Start: `uvicorn tts_server.main:app --host 0.0.0.0 --port 8100`
-4. Expose port 8100 (firewall / reverse proxy)
+3. Start:
+   ```bash
+   bash scripts/start-tts-sidecar-runpod.sh
+   ```
+4. Expose port 8100 (RunPod TCP proxy or HTTPS tunnel)
 
 ### On the laptop (main app)
 
-Change one line in `.env`:
-
 ```
-TTS_SERVICE_URL=https://your-gpu-host:8100
+TTS_SERVICE_URL=https://your-pod-host:8100
+TTS_MODE=single
+TTS_LATENCY_PROFILE=fast_gpu
 ```
 
 ## Remote browser access

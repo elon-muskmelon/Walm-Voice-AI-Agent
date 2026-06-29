@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.0-flash-lite"
     system_prompt: str = (
         "You are a real-time voice assistant. "
-        "Reply in short, natural spoken sentences (5–15 words each). "
+        "Reply in one or two short spoken sentences, under 20 words total. "
         "Never use markdown, bullet points, emojis, or long paragraphs. "
         "Be concise and conversational. "
         "Always reply in the same language the user spoke."
@@ -39,16 +39,20 @@ class Settings(BaseSettings):
     tts_default_language: str = "hindi"
     tts_default_speaker: str = "159"
     tts_sample_rate: int = 24000
+    tts_mode: Literal["single", "segment"] = "single"
+    # slow_gpu: server buffers all PCM before send (fluent, slowest start).
+    # balanced: stream PCM to client, client plays on end (fluent on slow GPU).
+    # fast_gpu: stream end-to-end (RunPod / GPU faster than realtime).
+    tts_latency_profile: Literal["slow_gpu", "balanced", "fast_gpu"] = "balanced"
 
     # ── ElevenLabs TTS ────────────────────────────────────────────────────────
     elevenlabs_model_id: str = "eleven_flash_v2_5"
     elevenlabs_tts_output_format: str = "mp3_44100_128"
-    # Chunk-length schedule controls how aggressively EL buffers before flushing
     elevenlabs_tts_chunk_schedule: List[int] = [50, 120, 160]
 
     # ── ElevenLabs STT ────────────────────────────────────────────────────────
     elevenlabs_stt_model_id: str = "scribe_v2_realtime"
-    elevenlabs_stt_language_code: str = ""   # empty = auto-detect
+    elevenlabs_stt_language_code: str = ""
 
     # ── Audio / VAD ───────────────────────────────────────────────────────────
     audio_sample_rate: int = 16000
@@ -60,15 +64,16 @@ class Settings(BaseSettings):
     vad_start_trigger_frames: int = 2
     vad_speech_threshold: float = 0.5
     vad_trailing_silence_keep_ms: int = 200
-    vad_model_path: str = ""            # path to Silero ONNX; empty → WebRTC
+    vad_model_path: str = ""
 
-    # Debug WAV dumps
     vad_debug_save: bool = False
     vad_debug_dir: str = "debug_utterances"
 
-    # ── TTS text segmentation ─────────────────────────────────────────────────
+    # ── TTS text segmentation (segment mode only) ─────────────────────────────
     tts_min_chars: int = 6
     tts_segment_timeout_ms: int = 100
+    tts_ideal_max_chars: int = 80
+    tts_hard_max_chars: int = 140
 
     # ── STT commit ────────────────────────────────────────────────────────────
     stt_commit_timeout_s: float = 15.0
@@ -76,6 +81,16 @@ class Settings(BaseSettings):
     # ── Server ────────────────────────────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8000
+
+    @property
+    def tts_buffer_before_play(self) -> bool:
+        return self.tts_latency_profile == "slow_gpu"
+
+    @property
+    def tts_client_buffer_until_end(self) -> bool:
+        # Balanced streams PCM during generation but must not play until complete
+        # on GPUs slower than realtime — otherwise playback outruns generation (gaps).
+        return self.tts_latency_profile in ("slow_gpu", "balanced")
 
     @field_validator("gemini_api_key", "elevenlabs_api_key")
     @classmethod
