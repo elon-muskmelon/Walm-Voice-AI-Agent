@@ -24,6 +24,7 @@ from starlette.requests import Request
 from starlette.websockets import WebSocketState
 
 from app.config import settings
+from app.debug_probe import probe
 from app.elevenlabs_stt_streamer import (
     ElevenLabsSTTSession,
     STTEvent,
@@ -72,6 +73,25 @@ async def lifespan(_app: FastAPI):
 
     global _tts
     _tts = create_tts_streamer()
+    logger.info(
+        "tts_config backend=%s url=%s profile=%s mode=%s",
+        settings.tts_backend,
+        settings.tts_service_url,
+        settings.tts_latency_profile,
+        settings.tts_mode,
+    )
+    # region agent log
+    probe(
+        "C",
+        "app/main.py:startup",
+        "Main app TTS config at startup",
+        {
+            "tts_service_url": settings.tts_service_url,
+            "tts_latency_profile": settings.tts_latency_profile,
+            "tts_mode": settings.tts_mode,
+        },
+    )
+    # endregion
 
     yield
 
@@ -278,11 +298,24 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 await state.send_json({"type": "error", "message": f"STT commit failed: {exc}"})
                 return
 
+            stt_ms = (time.monotonic() - commit_start) * 1000.0
+            vad_to_commit_ms = (time.monotonic() - endpoint_ts) * 1000.0
             logger.info(
                 "stt_commit_seconds=%.3f vad_to_commit=%.3f",
-                time.monotonic() - commit_start,
-                time.monotonic() - endpoint_ts,
+                stt_ms / 1000.0,
+                vad_to_commit_ms / 1000.0,
             )
+            # region agent log
+            probe(
+                "A",
+                "app/main.py:stt_commit",
+                "STT commit finished",
+                {
+                    "stt_commit_ms": round(stt_ms, 1),
+                    "vad_to_commit_ms": round(vad_to_commit_ms, 1),
+                },
+            )
+            # endregion
 
         state._last_partial = ""
         text = committed.text.strip()
